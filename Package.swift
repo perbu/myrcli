@@ -4,16 +4,16 @@
 import PackageDescription
 
 let package = Package(
-    name: "location",
+    name: "myrcli",
     platforms: [
         .macOS(.v11)
     ],
     products: [
-        .executable(name: "CoreLocationCLI", targets: ["CoreLocationCLI"])
+        .executable(name: "myrcli", targets: ["myrcli"])
     ],
     targets: [
         .executableTarget(
-            name: "CoreLocationCLI",
+            name: "myrcli",
             linkerSettings: [
                 .unsafeFlags([
                     "-Xlinker", "-sectcreate",

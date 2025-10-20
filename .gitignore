@@ -94,3 +94,5 @@ iOSInjectionProject/
 /.swiftpm
 /CoreLocationCLI.app
 /CoreLocationCLI.zip
+myrcli.app
+.DS_Store
