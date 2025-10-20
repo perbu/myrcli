@@ -27,19 +27,25 @@ Weather data from [Met.no](https://api.met.no/)
 
 ## Build
 
+Using make (recommended):
+
+```sh
+make build
+make install  # requires sudo
+```
+
+Or manually:
+
 ```sh
 swift build -c release
 mkdir -p myrcli.app/Contents/MacOS/
 cp ./.build/release/myrcli myrcli.app/Contents/MacOS/
 cp Info.plist myrcli.app/Contents
 codesign --force --deep --sign - myrcli.app
-```
-
-Then copy the executable to your PATH:
-
-```sh
 sudo cp ./myrcli.app/Contents/MacOS/myrcli /usr/local/bin/myrcli
 ```
+
+Run `make help` to see all available targets.
 
 ## macOS Permissions
 
