@@ -1,5 +1,7 @@
 # Myrcli
 
+![myrcli screenshot](screenshot.png)
+
 Displays the 24-hour weather forecast for your location.
 
 Make sure Wi-Fi is turned on.
