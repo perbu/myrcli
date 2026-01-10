@@ -10,7 +10,17 @@ import Foundation
 import CoreLocation
 
 // MARK: - Weather API Models
+struct WeatherGeometry: Codable {
+    let type: String
+    let coordinates: [Double]  // [longitude, latitude, altitude]
+
+    var longitude: Double { coordinates[0] }
+    var latitude: Double { coordinates[1] }
+    var altitude: Double? { coordinates.count > 2 ? coordinates[2] : nil }
+}
+
 struct WeatherResponse: Codable {
+    let geometry: WeatherGeometry
     let properties: WeatherProperties
 }
 
@@ -215,6 +225,11 @@ class Delegate: NSObject, CLLocationManagerDelegate {
             print("Weather forecast (next 24 hours):")
         }
 
+        // Show the exact forecast point from Met.no
+        let geo = weather.geometry
+        let altitudeStr = geo.altitude.map { String(format: "%.0fm", $0) } ?? "unknown"
+        print(String(format: "Forecast point: %.4f°N, %.4f°E, %@ elevation", geo.latitude, geo.longitude, altitudeStr))
+
         let now = Date()
         let twentyFourHoursLater = now.addingTimeInterval(24 * 60 * 60)
         let dateFormatter = ISO8601DateFormatter()
@@ -234,17 +249,25 @@ class Delegate: NSObject, CLLocationManagerDelegate {
             let temp = entry.data.instant.details.air_temperature
             let wind = entry.data.instant.details.wind_speed
 
-            var line = String(format: "%@  %4.0f°C  %4.1fm/s", timeStr, temp, wind)
+            // Build the formatted line with aligned columns
+            var line = String(format: "%@  %3.0f°C", timeStr, temp)
 
             // Add weather symbol and precipitation if available
             if let forecast = entry.data.next_1_hours ?? entry.data.next_6_hours {
                 let emoji = weatherSymbolToEmoji(forecast.summary.symbol_code)
                 let text = weatherSymbolToText(forecast.summary.symbol_code)
-                line += "  \(emoji) \(text)"
+                let paddedText = text.padding(toLength: 13, withPad: " ", startingAt: 0)
 
+                let precipStr: String
                 if let precip = forecast.details.precipitation_amount, precip > 0 {
-                    line += String(format: " %.1fmm", precip)
+                    precipStr = String(format: "%4.1fmm", precip)
+                } else {
+                    precipStr = "     "
                 }
+
+                line += String(format: "  %@ %-13@  %@  Wind: %3.1f m/s", emoji, paddedText, precipStr, wind)
+            } else {
+                line += String(format: "                              Wind: %3.1f m/s", wind)
             }
 
             print(line)
@@ -287,15 +310,70 @@ class Delegate: NSObject, CLLocationManagerDelegate {
         exit(1)
     }
 
+    func runWithCoordinates(lat: Double, lon: Double) {
+        let location = CLLocation(latitude: lat, longitude: lon)
+
+        // Reverse geocode to get location name
+        let geocoder = CLGeocoder()
+        geocoder.reverseGeocodeLocation(location) { placemarks, error in
+            var locationName: String? = nil
+
+            if let placemark = placemarks?.first {
+                locationName = self.formatLocationName(for: location, placemark: placemark)
+            }
+
+            self.fetchWeather(for: location) { result in
+                switch result {
+                case .success(let weather):
+                    self.printWeather(weather, for: location, locationName: locationName)
+                    exit(0)
+                case .failure(let error):
+                    print("Failed to fetch weather: \(error.localizedDescription)")
+                    exit(1)
+                }
+            }
+        }
+    }
+
+    func runWithLocationName(_ name: String) {
+        let geocoder = CLGeocoder()
+        geocoder.geocodeAddressString(name) { placemarks, error in
+            if let error = error {
+                print("Failed to find location '\(name)': \(error.localizedDescription)")
+                exit(1)
+            }
+
+            guard let placemark = placemarks?.first, let location = placemark.location else {
+                print("Could not find coordinates for '\(name)'")
+                exit(1)
+            }
+
+            let locationName = self.formatLocationName(for: location, placemark: placemark)
+
+            self.fetchWeather(for: location) { result in
+                switch result {
+                case .success(let weather):
+                    self.printWeather(weather, for: location, locationName: locationName)
+                    exit(0)
+                case .failure(let error):
+                    print("Failed to fetch weather: \(error.localizedDescription)")
+                    exit(1)
+                }
+            }
+        }
+    }
+
     func help() {
         print("""
-        USAGE: myrcli [--help] [--version]
+        USAGE: myrcli [OPTIONS]
 
-               Gets your current location and displays the 24-hour weather forecast
+               Gets weather forecast for your current location or a specified location.
 
         OPTIONS:
-          -h, --help     Display this help message and exit
-          --version      Display version information and exit
+          -h, --help              Display this help message and exit
+          --version               Display version information and exit
+          -l, --location NAME     Get forecast for a named location (e.g., "Oslo" or "New York, USA")
+          -c, --coords LAT,LON    Get forecast for specific coordinates (e.g., "59.91,10.75")
         """)
     }
 
@@ -306,17 +384,51 @@ class Delegate: NSObject, CLLocationManagerDelegate {
 }
 
 let delegate = Delegate()
-for argument in ProcessInfo().arguments {
-    switch argument {
+let arguments = ProcessInfo().arguments
+
+var i = 1  // Skip program name
+while i < arguments.count {
+    let arg = arguments[i]
+    switch arg {
     case "-h", "--help":
         delegate.help()
         exit(0)
     case "--version":
         delegate.version()
         exit(0)
+    case "-l", "--location":
+        i += 1
+        guard i < arguments.count else {
+            print("Error: --location requires a location name")
+            exit(1)
+        }
+        delegate.runWithLocationName(arguments[i])
+        autoreleasepool { RunLoop.main.run() }
+        exit(0)
+    case "-c", "--coords":
+        i += 1
+        guard i < arguments.count else {
+            print("Error: --coords requires coordinates in LAT,LON format")
+            exit(1)
+        }
+        let parts = arguments[i].split(separator: ",")
+        guard parts.count == 2,
+              let lat = Double(parts[0]),
+              let lon = Double(parts[1]) else {
+            print("Error: Invalid coordinates format. Use LAT,LON (e.g., 59.91,10.75)")
+            exit(1)
+        }
+        delegate.runWithCoordinates(lat: lat, lon: lon)
+        autoreleasepool { RunLoop.main.run() }
+        exit(0)
     default:
-        break
+        if arg.hasPrefix("-") {
+            print("Unknown option: \(arg)")
+            delegate.help()
+            exit(1)
+        }
     }
+    i += 1
 }
 
 delegate.start()
