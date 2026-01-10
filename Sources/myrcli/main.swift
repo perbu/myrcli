@@ -175,6 +175,40 @@ class Delegate: NSObject, CLLocationManagerDelegate {
         }
     }
 
+    func precipitationCategory(_ amount: Double) -> String {
+        switch amount {
+        case 0:
+            return ""
+        case ..<0.5:
+            return "Drizzle"
+        case 0.5..<2.0:
+            return "Light"
+        case 2.0..<5.0:
+            return "Moderate"
+        default:
+            return "Heavy"
+        }
+    }
+
+    func windDirectionArrow(_ degrees: Double) -> String {
+        // Wind comes FROM this direction, arrow shows where it's blowing TO
+        let directions = ["↓", "↙", "←", "↖", "↑", "↗", "→", "↘"]
+        let index = Int((degrees + 22.5) / 45.0) % 8
+        return directions[index]
+    }
+
+    func temperatureSparkline(_ temperatures: [Double]) -> String {
+        guard let minT = temperatures.min(), let maxT = temperatures.max(), maxT > minT else {
+            return String(repeating: "▄", count: min(temperatures.count, 12))
+        }
+        let blocks = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+        return temperatures.prefix(12).map { temp in
+            let normalized = (temp - minT) / (maxT - minT)
+            let index = min(7, Int(normalized * 7))
+            return blocks[index]
+        }.joined()
+    }
+
     func bearingToCompassDirection(from: CLLocation, to: CLLocation) -> String {
         let lat1 = from.coordinate.latitude * .pi / 180
         let lat2 = to.coordinate.latitude * .pi / 180
@@ -237,17 +271,86 @@ class Delegate: NSObject, CLLocationManagerDelegate {
         displayFormatter.dateFormat = "HH:mm"
         displayFormatter.timeZone = TimeZone.current
 
+        // First pass: collect data for summary and sparkline
+        var temperatures: [Double] = []
+        var precipHours: [(time: String, amount: Double)] = []
+        var highTemp: (temp: Double, time: String) = (-999, "")
+        var lowTemp: (temp: Double, time: String) = (999, "")
+        var dominantCondition = ""
+        var conditionCounts: [String: Int] = [:]
+
+        var entries24h: [(date: Date, entry: WeatherTimeseries)] = []
+
         for entry in weather.properties.timeseries {
             guard let entryDate = dateFormatter.date(from: entry.time) else { continue }
+            if entryDate < now || entryDate > twentyFourHoursLater { continue }
 
-            // Only show entries within next 24 hours
-            if entryDate < now || entryDate > twentyFourHoursLater {
-                continue
+            entries24h.append((date: entryDate, entry: entry))
+
+            let temp = entry.data.instant.details.air_temperature
+            let timeStr = displayFormatter.string(from: entryDate)
+            temperatures.append(temp)
+
+            if temp > highTemp.temp {
+                highTemp = (temp, timeStr)
+            }
+            if temp < lowTemp.temp {
+                lowTemp = (temp, timeStr)
             }
 
+            if let forecast = entry.data.next_1_hours ?? entry.data.next_6_hours {
+                let symbolCode = forecast.summary.symbol_code
+                conditionCounts[symbolCode, default: 0] += 1
+
+                if let precip = forecast.details.precipitation_amount, precip > 0 {
+                    precipHours.append((time: timeStr, amount: precip))
+                }
+            }
+        }
+
+        // Find dominant weather condition
+        dominantCondition = conditionCounts.max(by: { $0.value < $1.value })?.key ?? ""
+
+        // Generate summary line
+        print("")
+        var summaryEmoji = weatherSymbolToEmoji(dominantCondition)
+        var summaryText = ""
+
+        if !precipHours.isEmpty {
+            let firstPrecip = precipHours.first!.time
+            let lastPrecip = precipHours.last!.time
+            if firstPrecip == lastPrecip {
+                summaryText = "Precipitation around \(firstPrecip)"
+            } else {
+                summaryText = "Precipitation \(firstPrecip)-\(lastPrecip)"
+            }
+            summaryEmoji = "🌧️"
+        } else if dominantCondition.contains("clearsky") || dominantCondition.contains("fair") {
+            summaryText = "Clear skies"
+        } else if dominantCondition.contains("cloudy") {
+            summaryText = "Cloudy"
+        } else {
+            summaryText = weatherSymbolToText(dominantCondition)
+        }
+
+        print("\(summaryEmoji) \(summaryText). High: \(Int(highTemp.temp))°C at \(highTemp.time), low: \(Int(lowTemp.temp))°C at \(lowTemp.time)")
+
+        // Temperature sparkline
+        if temperatures.count >= 3 {
+            let sparkline = temperatureSparkline(temperatures)
+            let firstTemp = Int(temperatures.first!)
+            let lastTemp = Int(temperatures.last!)
+            print("Temperature: \(sparkline) (\(firstTemp)°→\(Int(highTemp.temp))°→\(lastTemp)°C)")
+        }
+
+        print("")
+
+        // Second pass: print hourly data
+        for (entryDate, entry) in entries24h {
             let timeStr = displayFormatter.string(from: entryDate)
             let temp = entry.data.instant.details.air_temperature
             let wind = entry.data.instant.details.wind_speed
+            let windDir = entry.data.instant.details.wind_from_direction
 
             // Build the formatted line with aligned columns
             var line = String(format: "%@  %3.0f°C", timeStr, temp)
@@ -260,14 +363,16 @@ class Delegate: NSObject, CLLocationManagerDelegate {
 
                 let precipStr: String
                 if let precip = forecast.details.precipitation_amount, precip > 0 {
-                    precipStr = String(format: "%4.1fmm", precip)
+                    precipStr = precipitationCategory(precip).padding(toLength: 8, withPad: " ", startingAt: 0)
                 } else {
-                    precipStr = "     "
+                    precipStr = "        "
                 }
 
-                line += String(format: "  %@ %-13@  %@  Wind: %3.1f m/s", emoji, paddedText, precipStr, wind)
+                let windDirStr = windDir.map { windDirectionArrow($0) } ?? " "
+                line += String(format: "  %@ %-13@  %@  %@ %3.1f m/s", emoji, paddedText, precipStr, windDirStr, wind)
             } else {
-                line += String(format: "                              Wind: %3.1f m/s", wind)
+                let windDirStr = windDir.map { windDirectionArrow($0) } ?? " "
+                line += String(format: "                                %@ %3.1f m/s", windDirStr, wind)
             }
 
             print(line)
