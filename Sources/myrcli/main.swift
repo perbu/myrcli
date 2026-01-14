@@ -63,6 +63,21 @@ struct PeriodDetails: Codable {
     let precipitation_amount: Double?
 }
 
+// MARK: - Sunrise API Models
+struct SunriseResponse: Codable {
+    let properties: SunriseProperties
+}
+
+struct SunriseProperties: Codable {
+    let sunrise: SunEvent?
+    let sunset: SunEvent?
+}
+
+struct SunEvent: Codable {
+    let time: String
+    let azimuth: Double?
+}
+
 class Delegate: NSObject, CLLocationManagerDelegate {
     let locationManager = CLLocationManager()
     var timeoutTimer: Timer? = nil
@@ -109,6 +124,54 @@ class Delegate: NSObject, CLLocationManagerDelegate {
             do {
                 let weatherResponse = try JSONDecoder().decode(WeatherResponse.self, from: data)
                 completion(.success(weatherResponse))
+            } catch {
+                completion(.failure(error))
+            }
+        }
+
+        task.resume()
+    }
+
+    func fetchSunrise(for location: CLLocation, date: Date = Date(), completion: @escaping (Result<SunriseResponse, Error>) -> Void) {
+        let lat = location.coordinate.latitude
+        let lon = location.coordinate.longitude
+
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "yyyy-MM-dd"
+        let dateString = dateFormatter.string(from: date)
+
+        // Get timezone offset (e.g., "+01:00" or "-05:00")
+        let seconds = TimeZone.current.secondsFromGMT()
+        let hours = abs(seconds) / 3600
+        let minutes = (abs(seconds) % 3600) / 60
+        let sign = seconds >= 0 ? "+" : "-"
+        let offset = String(format: "%@%02d:%02d", sign, hours, minutes)
+
+        let urlString = "https://api.met.no/weatherapi/sunrise/3.0/sun?lat=\(lat)&lon=\(lon)&date=\(dateString)&offset=\(offset)"
+
+        guard let url = URL(string: urlString) else {
+            completion(.failure(NSError(domain: "myrcli", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid URL"])))
+            return
+        }
+
+        var request = URLRequest(url: url)
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "Unknown"
+        request.setValue("Myrcli \(version) / per.buer@gmail.com", forHTTPHeaderField: "User-Agent")
+
+        let task = URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error = error {
+                completion(.failure(error))
+                return
+            }
+
+            guard let data = data else {
+                completion(.failure(NSError(domain: "myrcli", code: -1, userInfo: [NSLocalizedDescriptionKey: "No data received"])))
+                return
+            }
+
+            do {
+                let sunriseResponse = try JSONDecoder().decode(SunriseResponse.self, from: data)
+                completion(.success(sunriseResponse))
             } catch {
                 completion(.failure(error))
             }
@@ -252,7 +315,19 @@ class Delegate: NSObject, CLLocationManagerDelegate {
         return locationName
     }
 
-    func printWeather(_ weather: WeatherResponse, for location: CLLocation, locationName: String? = nil) {
+    func formatSunEventTime(_ isoTime: String) -> String? {
+        // API returns format like "2026-01-14T09:05+01:00" (no seconds)
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "yyyy-MM-dd'T'HH:mmxxxxx"
+        dateFormatter.locale = Locale(identifier: "en_US_POSIX")
+        guard let date = dateFormatter.date(from: isoTime) else { return nil }
+        let displayFormatter = DateFormatter()
+        displayFormatter.dateFormat = "HH:mm"
+        displayFormatter.timeZone = TimeZone.current
+        return displayFormatter.string(from: date)
+    }
+
+    func printWeather(_ weather: WeatherResponse, for location: CLLocation, locationName: String? = nil, sunrise: SunriseResponse? = nil) {
         if let locationName = locationName {
             print("Weather forecast for \(locationName) (next 24 hours):")
         } else {
@@ -263,6 +338,16 @@ class Delegate: NSObject, CLLocationManagerDelegate {
         let geo = weather.geometry
         let altitudeStr = geo.altitude.map { String(format: "%.0fm", $0) } ?? "unknown"
         print(String(format: "Forecast point: %.4f°N, %.4f°E, %@ elevation", geo.latitude, geo.longitude, altitudeStr))
+
+        // Build sunrise/sunset string for later use
+        var sunriseStr: String? = nil
+        if let sunrise = sunrise,
+           let sunriseTime = sunrise.properties.sunrise?.time,
+           let sunriseFormatted = formatSunEventTime(sunriseTime),
+           let sunsetTime = sunrise.properties.sunset?.time,
+           let sunsetFormatted = formatSunEventTime(sunsetTime) {
+            sunriseStr = "☀️ \(sunriseFormatted)-\(sunsetFormatted)"
+        }
 
         let now = Date()
         let twentyFourHoursLater = now.addingTimeInterval(24 * 60 * 60)
@@ -335,12 +420,18 @@ class Delegate: NSObject, CLLocationManagerDelegate {
 
         print("\(summaryEmoji) \(summaryText). High: \(Int(highTemp.temp))°C at \(highTemp.time), low: \(Int(lowTemp.temp))°C at \(lowTemp.time)")
 
-        // Temperature sparkline
+        // Temperature sparkline with sunrise/sunset
         if temperatures.count >= 3 {
             let sparkline = temperatureSparkline(temperatures)
             let firstTemp = Int(temperatures.first!)
             let lastTemp = Int(temperatures.last!)
-            print("Temperature: \(sparkline) (\(firstTemp)°→\(Int(highTemp.temp))°→\(lastTemp)°C)")
+            var tempLine = "Temperature: \(sparkline) (\(firstTemp)°→\(Int(highTemp.temp))°→\(lastTemp)°C)"
+            if let sunriseStr = sunriseStr {
+                tempLine += "  \(sunriseStr)"
+            }
+            print(tempLine)
+        } else if let sunriseStr = sunriseStr {
+            print(sunriseStr)
         }
 
         print("")
@@ -392,20 +483,40 @@ class Delegate: NSObject, CLLocationManagerDelegate {
                 locationName = self.formatLocationName(for: location, placemark: placemark)
             }
 
-            // Fetch weather with location name
+            // Fetch weather and sunrise data in parallel
+            let group = DispatchGroup()
+            var weatherResult: Result<WeatherResponse, Error>?
+            var sunriseResult: Result<SunriseResponse, Error>?
+
+            group.enter()
             self.fetchWeather(for: location) { result in
-                switch result {
+                weatherResult = result
+                group.leave()
+            }
+
+            group.enter()
+            self.fetchSunrise(for: location) { result in
+                sunriseResult = result
+                group.leave()
+            }
+
+            group.notify(queue: .main) {
+                switch weatherResult {
                 case .success(let weather):
-                    self.printWeather(weather, for: location, locationName: locationName)
+                    let sunrise = try? sunriseResult?.get()
+                    self.printWeather(weather, for: location, locationName: locationName, sunrise: sunrise)
                     exit(0)
                 case .failure(let error):
                     print("Failed to fetch weather: \(error.localizedDescription)")
+                    exit(1)
+                case .none:
+                    print("Failed to fetch weather: No response")
                     exit(1)
                 }
             }
         }
     }
-    
+
     func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
         if error._code == 1 {
             print("myrcli: ❌ Location services are disabled or location access denied. Please visit System Preferences > Security & Privacy > Privacy > Location Services")
@@ -427,13 +538,34 @@ class Delegate: NSObject, CLLocationManagerDelegate {
                 locationName = self.formatLocationName(for: location, placemark: placemark)
             }
 
+            // Fetch weather and sunrise data in parallel
+            let group = DispatchGroup()
+            var weatherResult: Result<WeatherResponse, Error>?
+            var sunriseResult: Result<SunriseResponse, Error>?
+
+            group.enter()
             self.fetchWeather(for: location) { result in
-                switch result {
+                weatherResult = result
+                group.leave()
+            }
+
+            group.enter()
+            self.fetchSunrise(for: location) { result in
+                sunriseResult = result
+                group.leave()
+            }
+
+            group.notify(queue: .main) {
+                switch weatherResult {
                 case .success(let weather):
-                    self.printWeather(weather, for: location, locationName: locationName)
+                    let sunrise = try? sunriseResult?.get()
+                    self.printWeather(weather, for: location, locationName: locationName, sunrise: sunrise)
                     exit(0)
                 case .failure(let error):
                     print("Failed to fetch weather: \(error.localizedDescription)")
+                    exit(1)
+                case .none:
+                    print("Failed to fetch weather: No response")
                     exit(1)
                 }
             }
@@ -455,13 +587,34 @@ class Delegate: NSObject, CLLocationManagerDelegate {
 
             let locationName = self.formatLocationName(for: location, placemark: placemark)
 
+            // Fetch weather and sunrise data in parallel
+            let group = DispatchGroup()
+            var weatherResult: Result<WeatherResponse, Error>?
+            var sunriseResult: Result<SunriseResponse, Error>?
+
+            group.enter()
             self.fetchWeather(for: location) { result in
-                switch result {
+                weatherResult = result
+                group.leave()
+            }
+
+            group.enter()
+            self.fetchSunrise(for: location) { result in
+                sunriseResult = result
+                group.leave()
+            }
+
+            group.notify(queue: .main) {
+                switch weatherResult {
                 case .success(let weather):
-                    self.printWeather(weather, for: location, locationName: locationName)
+                    let sunrise = try? sunriseResult?.get()
+                    self.printWeather(weather, for: location, locationName: locationName, sunrise: sunrise)
                     exit(0)
                 case .failure(let error):
                     print("Failed to fetch weather: \(error.localizedDescription)")
+                    exit(1)
+                case .none:
+                    print("Failed to fetch weather: No response")
                     exit(1)
                 }
             }
